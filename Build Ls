@@ -1,0 +1,55 @@
+async function fetchBuildByType(type: string): Promise<Build[]> {
+  const buildType = type.includes("VDI") ? "cnv" : "ide";
+  const queryParams: QueryParams = {
+    project_id: projectName,
+    build_type: type.includes("Prebuild") ? "default" : "custom"
+  };
+
+  const url =
+    getUserType() === "ADMIN"
+      ? buildType === "cnv"
+        ? `builder/cnv/images?build_type=${queryParams.build_type}`
+        : `builder?build_type=${queryParams.build_type}`
+      : getApiURL("builds", queryParams, buildType);
+
+  const res = await ApiService.getData<Build[]>(url);
+  if (type === "Prebuild-VDI-Images") {
+    return res.body.map(b => ({ ...b, id: b.id + uniqueId("-", 3) }));
+  }
+  return res.body || [];
+}
+
+const buildTypes = [
+  { label: "Prebuild-IDE-Images", key: "prebuildIDE" },
+  { label: "Custom-IDE-Images", key: "customIDE" },
+  { label: "Prebuild-VDI-Images", key: "prebuildVDI" },
+  { label: "Custom-VDI-Images", key: "customVDI" }
+];
+
+const buildQueries = buildTypes.map(({ label }) =>
+  useQuery({
+    queryKey: ["builds", label],
+    queryFn: () => fetchBuildByType(label),
+  })
+);
+
+// Then you can use buildQueries[index].data.length
+
+
+const buildQueries = useQueries({
+  queries: buildTypes.map(({ label }) => ({
+    queryKey: ["builds", label],
+    queryFn: () => fetchBuildByType(label),
+  }))
+});
+
+
+
+
+<div className={styles.buildCounts}>
+  {buildTypes.map((type, index) => (
+    <div key={type.key}>
+      <strong>{type.label}</strong>: {buildQueries[index].data?.length ?? 0}
+    </div>
+  ))}
+</div>
