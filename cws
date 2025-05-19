@@ -1,0 +1,602 @@
+import classes from "@/assets/styles/pages/workspace.module.css";
+import CronScheduler from "@/components/cron-scheduler";
+import Checkbox from "@/components/form/checkbox";
+import Input from "@/components/form/input";
+import Select from "@/components/form/select";
+import Modal from "@/components/utility/modal";
+import { useAlertContext } from "@/context/alert-context";
+import { useAuth } from "@/hooks/use-auth";
+import { useTitle } from "@/hooks/use-title";
+import ApiService from "@/shared/api-service";
+import { getApiURL } from "@/shared/utils";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useFormik } from "formik";
+import { Fragment, useEffect, useState } from "react";
+import { useNavigate } from "react-router-dom";
+import * as Yup from "yup";
+import CreateWorkspacePreview from "./create-workspace-preview";
+import CreateWorkspaceProgress from "./create-workspace-progress";
+
+interface Computes {
+  cpu: string[];
+  memory: string[];
+  drive: string[];
+}
+
+type Step = "template" | "image" | "compute" | "scheduler";
+
+export interface WorkspaceBody {
+  id: string;
+  name: string;
+  project_id: string;
+  template_id: string;
+  template_name: string;
+  workspace_type: "ide" | "cnv";
+  build_type: "default" | "custom";
+  schedule: boolean;
+  start_cron_expression?: string;
+  stop_cron_expression?: string;
+  tfconfig: {
+    image: string;
+    image_name: string;
+    cpu: string;
+    memory: string;
+    drive: string;
+    OS: string;
+    vm: string;
+  };
+  step: Step;
+  created_by: string;
+}
+
+const IDEComputes = {
+  cpu: ["1", "2", "3", "4"],
+  memory: ["2", "4", "6", "8"],
+  drive: ["10", "20", "30", "40"]
+};
+
+const CNVComputes = {
+  cpu: ["2", "4", "8", "16"],
+  memory: ["4", "8", "16", "32"],
+  drive: ["60", "80", "100", "120"]
+};
+
+const formProgressHeading: Record<Step, string> = {
+  template: "Select starter template for your workspace.",
+  image: "Select build image for your workspace.",
+  compute: "Select computes for your workspace.",
+  scheduler: "Select schedules for your workspace"
+};
+
+function CreateWorkspace() {
+  useTitle("Create Workspace");
+  const navigate = useNavigate();
+  const queryClient = useQueryClient();
+  const { setAlert } = useAlertContext();
+  const [open, setOpen] = useState(false);
+  const { user, projectName } = useAuth();
+  const [templates, setTemplates] = useState<Template[]>([]);
+  const [images, setImages] = useState<Build[]>([]);
+  const [computes, setComputes] = useState<Computes>(IDEComputes);
+
+  const initialValues: WorkspaceBody = {
+    id: "",
+    name: "",
+    project_id: projectName,
+    template_id: "",
+    template_name: "",
+    workspace_type: "ide",
+    build_type: "default",
+    schedule: false,
+    tfconfig: {
+      image: "",
+      image_name: "",
+      cpu: "",
+      memory: "",
+      drive: "",
+      OS: "linux",
+      vm: "vscode"
+    },
+    created_by: user?.email,
+    step: "template"
+  };
+
+  const validationSchema = Yup.object({
+    name: Yup.string()
+      .required("Name is required")
+      .matches(
+        /^[a-zA-Z](([a-zA-Z0-9]+[ -]{0,1})*[a-zA-Z0-9])?$/,
+        "Name cannot contain special characters other than space and dash."
+      )
+      .max(26, "Name exceeding max length of 26 characters."),
+    template_id: Yup.string().required("Template ID is required"),
+    project_id: Yup.string().required("Project Name is required"),
+    created_by: Yup.string().required("Created By is required"),
+    tfconfig: Yup.object()
+      .required()
+      .shape({
+        image: Yup.string().required("Image name is required"),
+        cpu: Yup.number().required("CPU count is required"),
+        memory: Yup.number().required("Memory size is required"),
+        drive: Yup.number().required("Storage size is required")
+      })
+  });
+
+  const formik = useFormik<WorkspaceBody>({
+    initialValues,
+    validationSchema,
+    onSubmit: values => mutate(values)
+  });
+
+  async function fetchTemplates(): Promise<void> {
+    try {
+      const res = await ApiService.getData<Template[]>(`templates?project_id=${projectName}`);
+      setTemplates(res.body);
+    } catch (err: any) {
+      setAlert((err as ApiError).message);
+      setTemplates([]);
+    }
+  }
+
+  async function fetchImages(): Promise<void> {
+    try {
+      formik.setFieldValue("tfconfig.image", "");
+      const queryParams: QueryParams = {
+        project_id: projectName
+      };
+      const url = getApiURL(
+        "builds",
+        { ...queryParams, build_type: formik.values.build_type },
+        formik.values.workspace_type
+      );
+      const res = await ApiService.getData<Build[]>(url);
+      setImages(res.body);
+    } catch (err: any) {
+      setAlert((err as ApiError).message);
+      setImages([]);
+    }
+  }
+
+  function generateWorkspaceID(name: string) {
+    return name.toLowerCase().replace(/\s+/g, "-");
+  }
+
+  function handleComputeChange(e: React.ChangeEvent<HTMLSelectElement>): void {
+    formik.handleChange(e);
+
+    if (e.target.name === "tfconfig.memory") {
+      formik.setFieldValue("tfconfig.cpu", computes.cpu[computes.memory.indexOf(e.target.value)]);
+    }
+
+    if (e.target.name === "tfconfig.cpu") {
+      formik.setFieldValue("tfconfig.memory", computes.memory[computes.cpu.indexOf(e.target.value)]);
+    }
+  }
+
+  function scheduleSleepShutdown(start_cron_expression: string, stop_cron_expression: string): void {
+    formik.setFieldValue("start_cron_expression", start_cron_expression);
+    formik.setFieldValue("stop_cron_expression", stop_cron_expression);
+    setOpen(false);
+  }
+
+  function getPrevStep(): Step {
+    const steps = { scheduler: "compute", compute: "image", image: "template" };
+    return steps[formik.values.step];
+  }
+
+  function getNextStep(): Step {
+    const steps = { template: "image", image: "compute", compute: "scheduler" };
+    return steps[formik.values.step];
+  }
+
+  function getPointerEvent(): "all" | "none" {
+    const events = {
+      template: formik.values.name && formik.values.template_id ? "all" : "none",
+      image: formik.values.name && formik.values.template_id && formik.values.tfconfig?.image ? "all" : "none",
+      compute:
+        formik.values.name &&
+        formik.values.template_id &&
+        formik.values.tfconfig?.image &&
+        formik.values.tfconfig?.cpu &&
+        formik.values.tfconfig?.memory &&
+        formik.values.tfconfig?.drive
+          ? "all"
+          : "none"
+    };
+    return events[formik.values.step];
+  }
+
+  const { mutate, isLoading } = useMutation({
+    mutationFn: createWorkspace,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["workspaces"] });
+    }
+  });
+
+  async function createWorkspace(values: Partial<WorkspaceBody>): Promise<void> {
+    try {
+      const tfconfig = {
+        ...values.tfconfig,
+        cpu: parseInt(values.tfconfig?.cpu || "0"),
+        memory: parseInt(values.tfconfig?.memory || "0"),
+        drive: parseInt(values.tfconfig?.drive || "0")
+      };
+      const body = { ...values, tfconfig };
+
+      delete body.build_type;
+      delete body.step;
+      delete body.workspace_type;
+      delete body.template_name;
+      delete body.tfconfig.image_name;
+      if (!body.schedule) {
+        delete body.start_cron_expression;
+        delete body.stop_cron_expression;
+      }
+      delete body.schedule;
+
+      const res = await ApiService.postData<typeof body, Workspace>("workspaces", body);
+      navigate(`/projects/${projectName}/workspaces`, { state: { workspace: res.body } });
+      setAlert(res.message, { type: "success" });
+    } catch (err: any) {
+      setAlert((err as ApiError).message);
+    }
+  }
+
+  useEffect(() => {
+    fetchTemplates();
+  }, []);
+
+  useEffect(() => {
+    if (formik.values.name) formik.setFieldValue("id", generateWorkspaceID(formik.values.name));
+  }, [formik.values.name]);
+
+  useEffect(() => {
+    if (formik.values.template_id) {
+      const templateType: "ide" | "cnv" = templates
+        ?.find(t => {
+          if (t.id === formik.values.template_id) {
+            formik.setFieldValue("tfconfig.OS", t.type.toLowerCase().includes("windows") ? "Windows" : "Linux");
+            formik.setFieldValue("template_name", t.name);
+          }
+          return t.id === formik.values.template_id;
+        })
+        ?.type.toLowerCase()
+        .includes("cnv")
+        ? "cnv"
+        : "ide";
+
+      if (templateType !== formik.values.workspace_type) {
+        formik.setFieldValue("workspace_type", templateType);
+        setComputes(templateType === "cnv" ? CNVComputes : IDEComputes);
+      } else if (images.length === 0) {
+        fetchImages();
+      }
+    }
+  }, [formik.values.template_id]);
+
+  useEffect(() => {
+    if (formik.values.template_id) fetchImages();
+  }, [formik.values.workspace_type, formik.values.build_type]);
+
+  useEffect(() => {
+    if (formik.values.tfconfig.image) {
+      formik.setFieldValue(
+        "tfconfig.image_name",
+        images.find(
+          img =>
+            img["image_url"] === formik.values.tfconfig.image ||
+            img.ImageURL === formik.values.tfconfig.image ||
+            img.name === formik.values.tfconfig.image
+        )?.name
+      );
+    }
+  }, [formik.values.tfconfig.image]);
+
+  useEffect(() => {
+    if (formik.values.schedule) {
+      formik.setFieldValue("start_cron_expression", "30 6 * * 1-5");
+      formik.setFieldValue("stop_cron_expression", "30 14 * * 1-5");
+    }
+  }, [formik.values.schedule]);
+
+  return (
+    <Fragment>
+      <article className="row">
+        <section className="col-12 col-lg-8 d-flex">
+          <CreateWorkspaceProgress
+            currentStep={formik.values.step}
+            changeStep={formik.setFieldValue}
+            isScheduled={formik.values.schedule}
+          />
+
+          <section className={classes["ws-form"]}>
+            <form onSubmit={formik.handleSubmit}>
+              <h3 className={`text-black-50 h3 ${formik.values.step === "scheduler" ? "mb-5" : "mb-3"}`}>
+                <i className="bi bi-info-circle me-3"></i>
+                {formProgressHeading[formik.values.step]}
+              </h3>
+
+              {formik.values.step === "template" && (
+                <Fragment>
+                  <div className="d-flex align-items-center gap-3">
+                    <label htmlFor="name" style={{ minWidth: "30%" }}>
+                      Workspace Name<span className="text-primary">*</span>
+                    </label>
+                    <Input
+                      name="name"
+                      className="form-control"
+                      placeholder="Enter Workspace Name"
+                      onChange={formik.handleChange}
+                      onBlur={formik.handleBlur}
+                      value={formik.values.name}
+                      error={formik.touched.name && formik.errors.name && formik.errors.name}
+                    />
+                  </div>
+
+                  <div className="d-flex align-items-center gap-3">
+                    <label htmlFor="name" style={{ minWidth: "30%" }}>
+                      Select Template<span className="text-primary">*</span>
+                    </label>
+                    <Select
+                      name="template_id"
+                      className="form-control fs-p"
+                      onChange={formik.handleChange}
+                      onBlur={formik.handleBlur}
+                      value={formik.values.template_id}
+                      error={formik.touched.template_id && formik.errors.template_id && formik.errors.template_id}
+                    >
+                      <option value="" hidden selected>
+                        Select Starter Template
+                      </option>
+                      {templates?.map(template => (
+                        <option key={template.created_at} value={template.id}>
+                          {template.name || template.id}
+                        </option>
+                      ))}
+                    </Select>
+                  </div>
+                </Fragment>
+              )}
+
+              {(formik.values.step === "template" || formik.values.step === "image") && (
+                <div className="d-flex align-items-center gap-3 my-5">
+                  <label htmlFor="workspace_type" style={{ minWidth: "30%" }}>
+                    Workspace Type<span className="text-primary">*</span>
+                  </label>
+                  <Checkbox
+                    disabled
+                    name="workspace_type"
+                    leftLabel="IDE"
+                    rightLabel="CNV"
+                    checked={formik.values.workspace_type === "cnv" ? true : false}
+                    onChange={e => formik.setFieldValue("workspace_type", e.target.checked ? "cnv" : "ide")}
+                  />
+                </div>
+              )}
+
+              {formik.values.step === "image" && (
+                <Fragment>
+                  <div className="d-flex align-items-center gap-3 mb-3">
+                    <label htmlFor="build_type" style={{ minWidth: "30%" }}>
+                      Build Type<span className="text-primary">*</span>
+                    </label>
+                    <Checkbox
+                      name="build_type"
+                      leftLabel="Default Build"
+                      rightLabel="Custom Build"
+                      checked={formik.values.build_type === "custom" ? true : false}
+                      onChange={e => formik.setFieldValue("build_type", e.target.checked ? "custom" : "default")}
+                    />
+                  </div>
+
+                  <div className="d-flex align-items-center gap-3 mb-5">
+                    <label htmlFor="tfconfig.image" style={{ minWidth: "30%" }}>
+                      Select Image<span className="text-primary">*</span>
+                    </label>
+                    <Select
+                      name="tfconfig.image"
+                      className="form-control fs-p"
+                      value={formik.values.tfconfig.image}
+                      onChange={formik.handleChange}
+                      onBlur={formik.handleBlur}
+                      error={
+                        formik.touched.tfconfig?.image && formik.errors.tfconfig?.image && formik.errors.tfconfig?.image
+                      }
+                    >
+                      <option value="" hidden selected>
+                        Select Build Image
+                      </option>
+                      {images?.map(image => (
+                        <option
+                          key={image.name}
+                          value={image["image_url"] || image.ImageURL || image.name}
+                          data-image={JSON.stringify(image)}
+                        >
+                          {image.name}
+                        </option>
+                      ))}
+                    </Select>
+                  </div>
+                </Fragment>
+              )}
+
+              {formik.values.step === "compute" && (
+                <Fragment>
+                  <div className="d-flex align-items-center gap-3">
+                    <label htmlFor="tfconfig.cpu" style={{ minWidth: "30%" }}>
+                      CPU<span className="text-primary">*</span>
+                    </label>
+                    <Select
+                      name="tfconfig.cpu"
+                      className="form-control fs-p"
+                      onChange={handleComputeChange}
+                      onBlur={formik.handleBlur}
+                      value={formik.values.tfconfig.cpu}
+                      error={formik.touched.tfconfig?.cpu && formik.errors.tfconfig?.cpu && formik.errors.tfconfig?.cpu}
+                    >
+                      <option value="" selected hidden>
+                        Select CPU Count
+                      </option>
+                      {computes.cpu.map(cpu => (
+                        <option key={cpu} value={cpu}>
+                          {cpu} Core
+                        </option>
+                      ))}
+                    </Select>
+                  </div>
+
+                  <div className="d-flex align-items-center gap-3">
+                    <label htmlFor="tfconfig.memory" style={{ minWidth: "30%" }}>
+                      Memory<span className="text-primary">*</span>
+                    </label>
+                    <Select
+                      name="tfconfig.memory"
+                      className="form-control fs-p"
+                      onChange={handleComputeChange}
+                      onBlur={formik.handleBlur}
+                      value={formik.values.tfconfig.memory}
+                      error={
+                        formik.touched.tfconfig?.memory &&
+                        formik.errors.tfconfig?.memory &&
+                        formik.errors.tfconfig?.memory
+                      }
+                    >
+                      <option value="" selected hidden>
+                        Select Memory Size
+                      </option>
+                      {computes.memory.map(memory => (
+                        <option key={memory} value={memory}>
+                          {memory} GB
+                        </option>
+                      ))}
+                    </Select>
+                  </div>
+
+                  <div className="d-flex align-items-center gap-3 mb-3">
+                    <label htmlFor="tfconfig.drive" style={{ minWidth: "30%" }}>
+                      Storage<span className="text-primary">*</span>
+                    </label>
+                    <Select
+                      name="tfconfig.drive"
+                      className="form-control fs-p"
+                      onChange={formik.handleChange}
+                      onBlur={formik.handleBlur}
+                      value={formik.values.tfconfig.drive}
+                      error={
+                        formik.touched.tfconfig?.drive && formik.errors.tfconfig?.drive && formik.errors.tfconfig?.drive
+                      }
+                    >
+                      <option value="" selected hidden>
+                        Select Storage
+                      </option>
+                      {computes.drive.map(drive => (
+                        <option key={drive} value={drive}>
+                          {drive} GB
+                        </option>
+                      ))}
+                    </Select>
+                  </div>
+                </Fragment>
+              )}
+
+              {(formik.values.step === "compute" || formik.values.step === "scheduler") && (
+                <div className="d-flex align-items-center gap-3 mb-3">
+                  <label htmlFor="schedule" style={{ minWidth: "30%" }}>
+                    Schedule<span className="text-primary">*</span>
+                  </label>
+                  <Checkbox
+                    name="schedule"
+                    leftLabel="Disabled"
+                    rightLabel="Enabled"
+                    checked={formik.values.schedule}
+                    onChange={formik.handleChange}
+                  />
+                </div>
+              )}
+
+              {formik.values.schedule && formik.values.step === "scheduler" && (
+                <Fragment>
+                  <div className="d-flex align-items-center gap-3">
+                    <label htmlFor="start_cron_expression" style={{ minWidth: "30%" }}>
+                      Start Schedule<span className="text-primary">*</span>
+                    </label>
+                    <span className="p-3">{formik.values.start_cron_expression}</span>
+                  </div>
+
+                  <div className="d-flex align-items-center gap-3 mb-5">
+                    <label htmlFor="stop_cron_expression" style={{ minWidth: "30%" }}>
+                      Stop Schedule<span className="text-primary">*</span>
+                    </label>
+                    <span className="p-3">{formik.values.stop_cron_expression}</span>
+                  </div>
+                </Fragment>
+              )}
+
+              <div className="mt-5">
+                {formik.values.step !== "template" && (
+                  <button
+                    type="button"
+                    className="btn btn-dark float-start"
+                    onClick={() => formik.setFieldValue("step", getPrevStep())}
+                  >
+                    Previous
+                  </button>
+                )}
+
+                {((formik.values.step === "compute" && !formik.values.schedule) ||
+                  formik.values.step === "scheduler") && (
+                  <button
+                    type="submit"
+                    className="btn btn-primary float-end ms-3"
+                    style={{ minWidth: "25%" }}
+                    disabled={!formik.isValid}
+                  >
+                    {isLoading ? (
+                      <div className="spinner-border text-light align-middle" role="status"></div>
+                    ) : (
+                      "Submit"
+                    )}
+                  </button>
+                )}
+
+                {!(
+                  (formik.values.step === "compute" && !formik.values.schedule) ||
+                  formik.values.step === "scheduler"
+                ) && (
+                  <button
+                    type="button"
+                    className="btn btn-primary float-end ms-3"
+                    style={{ minWidth: "25%", pointerEvents: getPointerEvent() }}
+                    onClick={() => formik.setFieldValue("step", getNextStep())}
+                  >
+                    Save & Next
+                  </button>
+                )}
+
+                {formik.values.schedule && formik.values.step === "scheduler" && (
+                  <button type="button" className="btn btn-info float-end" onClick={() => setOpen(true)}>
+                    Select Schedule
+                  </button>
+                )}
+              </div>
+            </form>
+            <Modal open={open} close={setOpen}>
+              <CronScheduler
+                defaultValues={{
+                  startCronString: formik.values.start_cron_expression || "30 6 * * 1-5",
+                  stopCronString: formik.values.stop_cron_expression || "30 14 * * 1-5"
+                }}
+                scheduleHandler={scheduleSleepShutdown}
+                // close={setToggleModal}
+              />
+            </Modal>
+          </section>
+        </section>
+
+        <CreateWorkspacePreview formData={formik.values} />
+      </article>
+    </Fragment>
+  );
+}
+
+export default CreateWorkspace;
